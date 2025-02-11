@@ -25,25 +25,13 @@ logger = logging.getLogger(__name__)
 def load_secrets():
     """시크릿 키 로드 함수"""
     with open("secrets.toml", "rb") as f:
-        secrets = tomli.load(f)
-        for key in ['anthropic', 'perplexity', 'serper', 'tavily']:
-            if not secrets['api'].get(key):
-                raise ValueError(f"Missing {key} API key")
-        return secrets
+        return tomli.load(f)
 
 SECRETS = load_secrets()
-ANTHROPIC_API_KEY = SECRETS["api"]["anthropic"]
 PERPLEXITY_API_KEY = SECRETS["api"]["perplexity"]
 SERPER_API_KEY = SECRETS["api"]["serper"]
 TAVILY_API_KEY = SECRETS["api"]["tavily"]
-
-def validate_anthropic_key():
-    try:
-        client = ChatAnthropic(anthropic_api_key=ANTHROPIC_API_KEY)
-        response = client.invoke("test")
-        return True
-    except:
-        return False
+ANTHROPIC_API_KEY = SECRETS["api"]["anthropic"]
 
 @dataclass
 class ConversationState:
@@ -157,14 +145,22 @@ class ResearchCollector:
     def __init__(self):
         self.serper_api_key = SERPER_API_KEY
         self.tavily_api_key = TAVILY_API_KEY
-        logger.info("Initializing ChatPerplexity...")
-        self.llm = ChatPerplexity(
-            model="sonar-pro",
-            api_key=PERPLEXITY_API_KEY,
-            temperature=0.7
-        )
-        logger.info("ChatPerplexity initialized successfully")
     
+    def _get_statistics_data(self, query: str) -> List[Dict]:
+        """통계 데이터 수집"""
+        try:
+            # 통계 데이터 추출을 위한 검색
+            response = self.llm.invoke(f"Find specific statistics, numbers and data about: {query}")
+            content = str(response.content) if hasattr(response, 'content') else str(response)
+            
+            # 통계 데이터 추출
+            statistics = self._extract_statistics_from_text(content)
+            
+            return statistics
+        except Exception as e:
+            logger.error(f"통계 데이터 수집 오류: {str(e)}")
+            return []
+
     def collect_research(self, keyword: str, subtopics: List[str]) -> Dict:
         """키워드와 소제목 관련 연구 자료 수집"""
         all_results = {
@@ -174,126 +170,73 @@ class ResearchCollector:
             'statistics': []
         }
         
-        # 1. 기본 키워드 검색 수행
-        base_queries = [
+        # 1. 키워드 관련 자료 수집
+        search_queries = [
             f"{keyword} 통계",
             f"{keyword} 연구결과",
-            f"{keyword} 최신 동향"
+            f"{keyword} 최신 동향",
+            f"{keyword} 시장 현황",
+            f"{keyword} 트렌드"
         ]
         
-        for query in base_queries:
-            self._process_query(query, all_results)
-        
-        # 2. 소제목 검색: 소제목이 확정되면 해당 소제목으로도 검색 수행
+        # 2. 소제목 관련 자료 수집
         for subtopic in subtopics:
-            subtopic_query = f"{keyword} {subtopic}"
-            self._process_query(subtopic_query, all_results)
+            search_queries.extend([
+                f"{keyword} {subtopic}",
+                f"{keyword} {subtopic} 통계",
+                f"{keyword} {subtopic} 연구"
+            ])
         
-        # 3. 중복 제거 및 정렬 (각 카테고리별 최대 결과 수 제한)
+        for query in search_queries:
+            # 뉴스 검색 (최신순으로 정렬)
+            news_results = self._get_news_from_serper(query)
+            all_results['news'].extend(news_results)
+            
+            # 학술 자료 검색
+            academic_results = self._get_academic_from_tavily(query)
+            all_results['academic'].extend(academic_results)
+            
+            # Perplexity 검색
+            perplexity_results = self._get_perplexity_search(query)
+            all_results['perplexity'].extend(perplexity_results)
+        
+        # 3. 통계 데이터 추출 (모든 수집된 자료에서)
+        for category in ['news', 'academic', 'perplexity']:
+            for item in all_results[category]:
+                statistics = self._extract_statistics_from_text(
+                    item.get('title', '') + ' ' + item.get('snippet', '')
+                )
+                if statistics:
+                    for stat in statistics:
+                        stat['source_url'] = item.get('url', '')
+                        stat['source_title'] = item.get('title', '')
+                        # 출처와 날짜 정보 추가
+                        stat['source'] = item.get('source', '')
+                        stat['date'] = item.get('date', '')
+                    all_results['statistics'].extend(statistics)
+        
+        # 4. 중복 제거 및 최신순 정렬
         for category in all_results:
             all_results[category] = self._deduplicate_results(all_results[category])
+            # 날짜 정보가 있는 경우 최신순 정렬
             if category in ['news', 'statistics']:
                 all_results[category].sort(
                     key=lambda x: x.get('date', ''), 
                     reverse=True
                 )
-            all_results[category] = all_results[category][:3]
         
         return all_results
 
-    def _process_query(self, query: str, all_results: Dict) -> Dict:
-        """단일 쿼리 처리 및 결과 수집"""
-        new_results = {
-            'news': [],
-            'academic': [],
-            'perplexity': []
-        }
-        
-        # 뉴스 검색 (최신순)
-        if len(all_results['news']) < 3:
-            news_results = self._get_news_from_serper(query, limit=1)
-            all_results['news'].extend(news_results)
-            new_results['news'].extend(news_results)
-        
-        # 학술 자료 검색
-        if len(all_results['academic']) < 3:
-            academic_results = self._get_academic_from_tavily(query, limit=1)
-            all_results['academic'].extend(academic_results)
-            new_results['academic'].extend(academic_results)
-        
-        # Perplexity 검색
-        if len(all_results['perplexity']) < 3:
-            perplexity_results = self._get_perplexity_search(query, limit=1)
-            all_results['perplexity'].extend(perplexity_results)
-            new_results['perplexity'].extend(perplexity_results)
-        
-        # 통계 데이터 추출
-        for category in ['news', 'academic', 'perplexity']:
-            for item in new_results[category]:
-                if len(all_results['statistics']) >= 6:  # 통계 데이터 최대 6개로 제한
-                    break
-                    
-                statistics = self._extract_statistics_from_text(
-                    item.get('title', '') + ' ' + item.get('snippet', ''),
-                    limit=2  # 각 아이템당 최대 2개의 통계만 추출
-                )
-                
-                if statistics:
-                    for stat in statistics:
-                        stat['source_url'] = item.get('url', '')
-                        stat['source_title'] = item.get('title', '')
-                        stat['source'] = item.get('source', '')
-                        stat['date'] = item.get('date', '')
-                    all_results['statistics'].extend(statistics)
-        
-        return new_results
-
-    def _has_sufficient_results(self, results: Dict) -> bool:
-        """충분한 결과가 수집되었는지 확인"""
-        return (len(results['news']) >= 3 and 
-                len(results['academic']) >= 3 and 
-                len(results['perplexity']) >= 3 and 
-                len(results['statistics']) >= 6)
-
-    def _extract_statistics_from_text(self, text: str, limit: int = 2) -> List[Dict]:
-        """텍스트에서 통계 데이터 추출 (결과 제한)"""
-        statistics = []
-        
-        # 숫자/퍼센트 패턴
-        patterns = [
-            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:명|개|원|달러|위|배|천|만|억|%|퍼센트)',  # 한글 단위
-            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:people|users|dollars|percent|%)',  # 영문 단위
-            r'(\d+(?:\.\d+)?)[%％]'  # 퍼센트 기호
-        ]
-        
-        for pattern in patterns:
-            if len(statistics) >= limit:  # 지정된 수만큼 찾았으면 중단
-                break
-                
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                if len(statistics) >= limit:
-                    break
-                    
-                # 통계 데이터의 전후 문맥 추출 (최대 100자)
-                start = max(0, match.start() - 50)
-                end = min(len(text), match.end() + 50)
-                context = text[start:end].strip()
-                
-                statistics.append({
-                    'value': match.group(0),
-                    'context': context,
-                    'pattern_type': 'numeric' if '%' not in match.group(0) else 'percentage'
-                })
-        
-        return statistics
-
-    def _get_perplexity_search(self, query: str, limit: int = 3) -> List[Dict]:
-        """Perplexity를 통한 검색 (결과 제한)"""
-        logger.info("Starting Perplexity search...")  # API 키 출력 부분 제거
+    def _get_perplexity_search(self, query: str, limit: int = 5) -> List[Dict]:
+        """Perplexity를 통한 검색"""
         try:
+            self.llm = ChatPerplexity(
+                model="sonar-pro",
+                api_key=PERPLEXITY_API_KEY,
+                temperature=0.7
+            )
             # 통계 데이터와 관련된 검색 수행
-            stats_prompt = f"Find specific statistics, numbers, research data, news, and articles about: {query}. Limit to top {limit} most relevant results."
+            stats_prompt = f"Find statistics, numbers, research data, news, and articles about: {query}"
             response = self.llm.invoke(stats_prompt)
             content = str(response.content) if hasattr(response, 'content') else str(response)
             
@@ -314,19 +257,43 @@ class ResearchCollector:
             logger.error(f"Perplexity 검색 오류: {str(e)}")
             return []
 
-    def _get_news_from_serper(self, query: str, limit: int = 3) -> List[Dict]:
-        """Serper를 통한 뉴스 검색 (결과 제한)"""
-        logger.info(f"Starting Serper search with API key: {self.serper_api_key[:10]}...")
+    def _extract_statistics_from_text(self, text: str) -> List[Dict]:
+        """텍스트에서 통계 데이터 추출"""
+        statistics = []
+        
+        # 숫자/퍼센트 패턴
+        patterns = [
+            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:명|개|원|달러|위|배|천|만|억|%|퍼센트)',  # 한글 단위
+            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:people|users|dollars|percent|%)',  # 영문 단위
+            r'(\d+(?:\.\d+)?)[%％]'  # 퍼센트 기호
+        ]
+        
+        for pattern in patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                # 통계 데이터의 전후 문맥 추출 (최대 100자)
+                start = max(0, match.start() - 50)
+                end = min(len(text), match.end() + 50)
+                context = text[start:end].strip()
+                
+                statistics.append({
+                    'value': match.group(0),
+                    'context': context,
+                    'pattern_type': 'numeric' if '%' not in match.group(0) else 'percentage'
+                })
+        
+        return statistics
 
+    def _get_news_from_serper(self, query: str) -> List[Dict]:
+        """Serper를 통한 뉴스 검색"""
         try:
-            conn = http.client.HTTPSConnection("google.serper.dev", timeout=10)
+            conn = http.client.HTTPSConnection("google.serper.dev")
             payload = json.dumps({
                 "q": query,
                 "gl": "kr",
                 "hl": "ko",
                 "type": "news",
-                "timerange": "y",  # 최근 1년 데이터만 검색
-                "num": limit  # API 요청 시 결과 수 제한
+                "timerange": "y"
             })
             headers = {
                 'X-API-KEY': self.serper_api_key,
@@ -338,11 +305,11 @@ class ResearchCollector:
             data = json.loads(res.read().decode("utf-8"))
             
             results = []
-            for item in data.get("news", [])[:limit]:  # 지정된 수만큼만 결과 반환
+            for item in data.get("news", [])[:3]:  # 상위 3개 결과만 사용
                 results.append({
                     'title': item.get('title', ''),
                     'url': item.get('link', ''),
-                    'snippet': item.get('snippet', '')[:200],  # 스니펫 길이 제한
+                    'snippet': item.get('snippet', ''),
                     'date': item.get('date', ''),
                     'source': item.get('source', '')
                 })
@@ -353,34 +320,29 @@ class ResearchCollector:
             logger.error(f"Serper API 오류: {str(e)}")
             return []
 
-    def _get_academic_from_tavily(self, query: str, limit: int = 3) -> List[Dict]:
-        """Tavily를 통한 학술 자료 검색 (결과 제한)"""
-        logger.info(f"Starting Tavily search with API key: {self.tavily_api_key[:10]}...")
-
+    def _get_academic_from_tavily(self, query: str) -> List[Dict]:
+        """Tavily를 통한 학술 자료 검색"""
         try:
             client = TavilyClient(api_key=self.tavily_api_key)
             response = client.search(
                 query=f"{query} research paper statistics",
-                search_depth="basic",  # basic으로 변경하여 빠른 응답
-                max_results=limit,  # API 요청 시 결과 수 제한
-                time_range="year"
+                search_depth="advanced",
+                time_range="year",
+                include_answer="true"
             )
             
+            # Tavily 응답에서 academic_papers 필터링
             results = []
-            # Tavily 응답에서 academic_papers 필터링 (상위 N개만)
-            for result in response.get('results', [])[:limit]:
+            for result in response.get('results', [])[:3]:  # 상위 3개 결과만 사용
                 if any(domain in result.get('url', '').lower() for domain in 
-                    ['scholar.google', 'researchgate', 'academia.edu', 'sci-hub', 
-                    'pubmed', 'arxiv', 'springer', 'sciencedirect']):
+                      ['scholar.google', 'researchgate', 'academia.edu', 'sci-hub', 
+                       'pubmed', 'arxiv', 'springer', 'sciencedirect']):
                     results.append({
                         'title': result.get('title', ''),
                         'url': result.get('url', ''),
-                        'snippet': result.get('content', '')[:200],  # 스니펫 길이 제한
+                        'snippet': result.get('content', ''),
                         'score': result.get('score', 0)
                     })
-                    
-                    if len(results) >= limit:  # 원하는 수만큼 결과를 찾으면 중단
-                        break
             
             return results
             
@@ -389,185 +351,77 @@ class ResearchCollector:
             return []
 
     def _deduplicate_results(self, results: List[Dict]) -> List[Dict]:
-        return list({result.get('url', ''): result for result in results if result.get('url')}.values())
+        """검색 결과 중복 제거"""
+        seen_urls = set()
+        unique_results = []
+        
+        for result in results:
+            url = result.get('url', '')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(result)
+        
+        return unique_results
 
 class ContentGenerator:
     """Claude를 사용한 콘텐츠 생성 및 최적화 클래스"""
-    
     def __init__(self):
-        try:
-            logger.info("Initializing ContentGenerator...")
-            if not ANTHROPIC_API_KEY:
-                raise ValueError("Anthropic API key is missing")
-            if not ANTHROPIC_API_KEY.startswith('sk-ant-'):
-                raise ValueError("Invalid Anthropic API key format")
-            
-            self.claude = ChatAnthropic(
-                anthropic_api_key=ANTHROPIC_API_KEY,
-                model="claude-3-opus-20240229",
-                temperature=0.7,
-                max_tokens=4096
-            )
-            logger.info("Claude initialized successfully")
-            self.okt = Okt()
-        except Exception as e:
-            logger.error(f"Error initializing ContentGenerator: {str(e)}")
-            raise
+        self.claude = ChatAnthropic(
+            anthropic_api_key=ANTHROPIC_API_KEY,
+            model="claude-3-opus-20240229",
+            temperature=0.7,
+            max_tokens=4096
+        )
+        self.okt = Okt()
 
     def generate_content(self, data: Dict) -> str:
+        """콘텐츠 생성"""
         MAX_RETRIES = 3
-        RETRY_DELAY = 2
-        
+        RETRY_DELAY = 2  # 초
+
         for attempt in range(MAX_RETRIES):
             try:
                 prompt = self._create_content_prompt(data)
-                logger.info("Prompt created successfully...")
-                
                 response = self.claude.invoke(prompt)
-                content = str(response.content) if hasattr(response, 'content') else str(response)
+                content = str(response)
                 
+                # 최적화 필요 여부 확인
                 if self._needs_optimization(content, data['keyword']):
                     content = self.optimize_content(content, data)
-                    
+                
+                # 참고자료가 있을 경우에만 출처 추가
                 if isinstance(data.get('research_data'), dict):
                     content = self.add_references(content, data['research_data'])
                     
                 return content
 
             except anthropic.InternalServerError as e:
-                if 'overloaded_error' in str(e) and attempt < MAX_RETRIES - 1:
-                    st.warning(f"서버가 혼잡합니다. {RETRY_DELAY}초 후 재시도합니다... ({attempt + 1}/{MAX_RETRIES})")
-                    time.sleep(RETRY_DELAY)
-                    continue
+                if 'overloaded_error' in str(e):
+                    if attempt < MAX_RETRIES - 1:  # 마지막 시도가 아니면
+                        st.warning(f"서버가 혼잡합니다. {RETRY_DELAY}초 후 재시도합니다... ({attempt + 1}/{MAX_RETRIES})")
+                        time.sleep(RETRY_DELAY)
+                        continue
                 logger.error(f"콘텐츠 생성 중 오류 발생: {str(e)}")
                 raise e
             except Exception as e:
                 logger.error(f"콘텐츠 생성 중 오류 발생: {str(e)}")
                 raise e
 
-
     def optimize_content(self, content: str, data: Dict) -> str:
+        """콘텐츠 최적화"""
         try:
             optimization_prompt = self._create_optimization_prompt(content, data)
             response = self.claude.invoke(optimization_prompt)
-            return str(response.content) if hasattr(response, 'content') else str(response)
+            
+            # Claude의 응답 처리
+            if hasattr(response, 'content'):
+                return response.content
+            else:
+                return str(response)
+
         except Exception as e:
             logger.error(f"콘텐츠 최적화 중 오류 발생: {str(e)}")
             raise e
-
-    def _find_citation_in_content(self, content: str, source_info: Dict) -> bool:
-        """본문에서 인용 여부 확인"""
-        content_lower = content.lower()
-        title = source_info.get('title', '').lower()
-        snippet = source_info.get('snippet', '').lower()
-        
-        # 인용 패턴 확인
-        citation_patterns = [
-            "연구에 따르면",
-            "통계에 의하면",
-            "조사 결과",
-            "보고서에 따르면",
-            "발표한 자료에 따르면",
-            "의 연구진은",
-            "에 따르면",
-            "에 의하면",
-            "출처:",
-            "자료:"
-        ]
-        
-        # 1. 제목이나 스니펫에서 핵심 수치나 문구 추출
-        numbers = re.findall(r'\d+(?:\.\d+)?%?', snippet)
-        key_phrases = re.findall(r'[^\s,]+\s[^\s,]+\s[^\s,]+', snippet)
-        
-        # 2. 인용 패턴과 함께 수치/문구가 사용되었는지 확인
-        for pattern in citation_patterns:
-            for number in numbers:
-                if f"{pattern} {number}" in content_lower:
-                    return True
-            for phrase in key_phrases:
-                if f"{pattern} {phrase}" in content_lower:
-                    return True
-        
-        # 3. 제목이나 스니펫의 핵심 내용이 본문에 포함되어 있는지 확인
-        if (title and title in content_lower) or (snippet and snippet in content_lower):
-            return True
-        
-        return False
-
-    def add_references(self, content: str, research_data: Dict) -> str:
-        """콘텐츠에 사용된 출처와 모든 관련 자료 추가"""
-        used_sources = []
-        all_sources = []
-        
-        # 모든 소스 수집 및 분류
-        for source_type, items in research_data.items():
-            if not isinstance(items, list):
-                continue
-                
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                    
-                title = item.get('title', '')
-                url = item.get('url', '')
-                snippet = item.get('snippet', '').lower()
-                date = item.get('date', '')
-                
-                if not url:  # URL이 없는 경우 건너뛰기
-                    continue
-                
-                source_info = {
-                    'type': source_type,
-                    'title': title,
-                    'url': url,
-                    'date': date,
-                    'snippet': snippet
-                }
-                
-                # 본문에서 사용된 소스 확인 - 새로운 매칭 로직 사용
-                if self._find_citation_in_content(content, source_info):
-                    used_sources.append(source_info)
-                
-                all_sources.append(source_info)
-        
-        # 참고자료 섹션 추가
-        content += "\n\n---\n## 참고자료\n"
-        
-        # 본문에서 사용된 자료
-        if used_sources:
-            content += "\n### 📚 본문에서 인용된 자료\n"
-            for source in used_sources:
-                if source['date']:
-                    content += f"- [{source['title']}]({source['url']}) ({source['date']})\n"
-                else:
-                    content += f"- [{source['title']}]({source['url']})\n"
-        
-        # 모든 관련 자료
-        content += "\n### 🔍 추가 참고자료\n"
-        
-        # 뉴스 자료
-        content += "\n#### 📰 뉴스 자료\n"
-        news_sources = [s for s in all_sources if s['type'] == 'news']
-        for source in news_sources:
-            content += f"- [{source['title']}]({source['url']})"
-            if source['date']:
-                content += f" ({source['date']})"
-            content += "\n"
-        
-        # 학술 자료
-        content += "\n#### 📚 학술/연구 자료\n"
-        academic_sources = [s for s in all_sources if s['type'] == 'academic']
-        for source in academic_sources:
-            content += f"- [{source['title']}]({source['url']})\n"
-        
-        # Perplexity 검색 결과
-        if any(s for s in all_sources if s['type'] == 'perplexity'):
-            content += "\n#### 🔍 추가 검색 결과\n"
-            perplexity_sources = [s for s in all_sources if s['type'] == 'perplexity']
-            for source in perplexity_sources:
-                content += f"- [{source['title']}]({source['url']})\n"
-        
-        return content
 
     def count_chars(self, text: str) -> dict:
         """글자수 분석"""
@@ -653,13 +507,18 @@ class ContentGenerator:
             """
             
             response = self.claude.invoke(reference_prompt)
-            analysis = str(response.content) if hasattr(response, 'content') else str(response)
             
+            # Claude의 응답 처리
+            if hasattr(response, 'content'):
+                analysis = response.content
+            else:
+                analysis = str(response)
+                
             return {
                 'url': reference_url,
                 'analysis': analysis
             }
-                
+            
         except Exception as e:
             logger.error(f"참고 블로그 분석 중 오류 발생: {str(e)}")
             return {
@@ -669,6 +528,7 @@ class ContentGenerator:
         
 
     def _create_content_prompt(self, data: Dict) -> str:
+        """상세한 조건을 포함한 프롬프트 생성"""
         keyword = data["keyword"]
         morphemes = self.okt.morphs(keyword)
         
@@ -700,20 +560,14 @@ class ContentGenerator:
             for stat in research_data['statistics']:
                 statistics_text += f"- {stat['context']} (출처: {stat['source_title']})\n"
 
-        # 프롬프트에 추가 지시사항 반영
         prompt = f"""
-        다음 조건들을 준수하여 전문성과 친근함이 조화된, 읽기 쉽고 실용적인 블로그 글을 작성해주세요:
+        다음 조건을 준수하여 전문성 있고 친근한 블로그 글을 작성해주세요:
 
         필수 활용 자료:
         {research_text}
         
         통계 자료 (반드시 1개 이상 활용):
         {statistics_text}
-
-        **추가 지시사항:**
-        1. 각 소제목 중 최소 2개 소제목에 대해서는 해당 소제목과 직접 연관된 기사나 통계자료를 최소 1건 이상 인용하여 내용을 보강해 주세요.
-        2. 생성된 글 내에 [숫자] 형태의 인용 표기가 있을 경우, 그 숫자에 해당하는 연구 자료의 링크를 활용하거나, 글의 참고자료 섹션에서 해당 링크를 명확하게 표시해 주세요.
-        예를 들어, "브레이크라이닝의 구조와 작동 원리[2][6]"라면, [2]와 [6]에 연결된 링크(출처)가 실제로 활용되도록 작성해 주세요.
 
         1. 글의 구조와 형식
         - 전체 구조: 서론(20%) - 본론(60%) - 결론(20%)
@@ -751,7 +605,7 @@ class ContentGenerator:
         - 주 키워드: {keyword}
         - 형태소: {', '.join(morphemes)}
         - 각 키워드와 형태소 17-20회 자연스럽게 사용
-            
+        
         5. [필수] 참고 자료 활용
         - 각 소제목 섹션마다 최소 1개 이상의 관련 통계/연구 자료 반드시 인용
         - 인용할 때는 "~에 따르면", "~의 연구 결과", "~의 통계에 의하면" 등 명확한 표현 사용
@@ -775,12 +629,12 @@ class ContentGenerator:
         8. 참고 블로그 분석 결과 반영:
         {reference_analysis}
 
-        위 조건들을 바탕으로, 특히 타겟 독자({target_audience.get('primary', '')})의 어려움을 해결하는 데 초점을 맞추어 블로그 글을 작성해주세요.
+        위 조건들을 바탕으로 전문성과 친근함이 조화된,
+        읽기 쉽고 실용적인 블로그 글을 작성해주세요.
+        특히 타겟 독자({target_audience.get('primary', '')})의 어려움을 해결하는데 초점을 맞춰주세요.
         """
         
         return prompt
-
-
 
     def _create_optimization_prompt(self, content: str, data: Dict) -> str:
         keyword = data['keyword']
@@ -885,6 +739,81 @@ class ContentGenerator:
             'keyword_count': keyword_count,
             'density': keyword_count / total_words if total_words > 0 else 0
         }
+
+    def add_references(self, content: str, research_data: Dict) -> str:
+        """콘텐츠에 사용된 출처와 모든 관련 자료 추가"""
+        used_sources = []
+        all_sources = []
+        
+        # 모든 소스 수집 및 분류
+        for source_type, items in research_data.items():
+            if not isinstance(items, list):
+                continue
+                
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                    
+                title = item.get('title', '')
+                url = item.get('url', '')
+                snippet = item.get('snippet', '').lower()
+                date = item.get('date', '')
+                
+                if not url:  # URL이 없는 경우 건너뛰기
+                    continue
+                
+                source_info = {
+                    'type': source_type,
+                    'title': title,
+                    'url': url,
+                    'date': date,
+                    'snippet': snippet
+                }
+                
+                # 본문에서 사용된 소스 확인
+                if snippet and (snippet in content.lower() or (title and title.lower() in content.lower())):
+                    used_sources.append(source_info)
+                
+                all_sources.append(source_info)
+        
+        # 참고자료 섹션 추가
+        content += "\n\n---\n## 참고자료\n"
+        
+        # 본문에서 사용된 자료
+        if used_sources:
+            content += "\n### 📚 본문에서 인용된 자료\n"
+            for source in used_sources:
+                if source['date']:
+                    content += f"- [{source['title']}]({source['url']}) ({source['date']})\n"
+                else:
+                    content += f"- [{source['title']}]({source['url']})\n"
+        
+        # 모든 관련 자료
+        content += "\n### 🔍 추가 참고자료\n"
+        
+        # 뉴스 자료
+        content += "\n#### 📰 뉴스 자료\n"
+        news_sources = [s for s in all_sources if s['type'] == 'news']
+        for source in news_sources:
+            content += f"- [{source['title']}]({source['url']})"
+            if source['date']:
+                content += f" ({source['date']})"
+            content += "\n"
+        
+        # 학술 자료
+        content += "\n#### 📚 학술/연구 자료\n"
+        academic_sources = [s for s in all_sources if s['type'] == 'academic']
+        for source in academic_sources:
+            content += f"- [{source['title']}]({source['url']})\n"
+        
+        # Perplexity 검색 결과
+        if any(s for s in all_sources if s['type'] == 'perplexity'):
+            content += "\n#### 🔍 추가 검색 결과\n"
+            perplexity_sources = [s for s in all_sources if s['type'] == 'perplexity']
+            for source in perplexity_sources:
+                content += f"- [{source['title']}]({source['url']})\n"
+        
+        return content
 
 class BlogChainSystem:
     """전체 시스템 관리 클래스"""
@@ -1264,11 +1193,6 @@ class BlogChainSystem:
         state = st.session_state.conversation_state
         
         try:
-            if not ANTHROPIC_API_KEY or not ANTHROPIC_API_KEY.startswith('sk-ant-'):
-                st.error("유효하지 않은 Anthropic API 키입니다. API 키를 확인해주세요.")
-                logger.error(f"Invalid Anthropic API key format: {ANTHROPIC_API_KEY[:10]}...")
-                return
-            
             data = {
                 "keyword": state.data.get('keyword', ''),
                 "subtopics": state.data.get('subtopics', []) or state.data.get('recommended_subtopics', []),
