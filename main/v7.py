@@ -495,7 +495,7 @@ class ContentGenerator:
         return False
 
     def add_references(self, content: str, research_data: Dict) -> str:
-        """콘텐츠에 사용된 출처와 모든 관련 자료 추가"""
+        """콘텐츠에 사용된 출처와 모든 관련 자료를 추가하고, 출처를 클릭 가능한 링크로 표시"""
         used_sources = []
         all_sources = []
         
@@ -503,11 +503,10 @@ class ContentGenerator:
         for source_type, items in research_data.items():
             if not isinstance(items, list):
                 continue
-                
+                    
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                    
                 title = item.get('title', '')
                 url = item.get('url', '')
                 snippet = item.get('snippet', '').lower()
@@ -524,7 +523,7 @@ class ContentGenerator:
                     'snippet': snippet
                 }
                 
-                # 본문에서 사용된 소스 확인 - 새로운 매칭 로직 사용
+                # 본문에서 사용된 자료 확인 (인용 여부 판단)
                 if self._find_citation_in_content(content, source_info):
                     used_sources.append(source_info)
                 
@@ -533,41 +532,44 @@ class ContentGenerator:
         # 참고자료 섹션 추가
         content += "\n\n---\n## 참고자료\n"
         
-        # 본문에서 사용된 자료
+        # 1. 본문에서 인용된 자료 (클릭 가능한 번호 링크)
         if used_sources:
             content += "\n### 📚 본문에서 인용된 자료\n"
-            for source in used_sources:
+            for idx, source in enumerate(used_sources, start=1):
                 if source['date']:
-                    content += f"- [{source['title']}]({source['url']}) ({source['date']})\n"
+                    content += f"- [{idx}] [{source['title']}]({source['url']}) ({source['date']})\n"
                 else:
-                    content += f"- [{source['title']}]({source['url']})\n"
+                    content += f"- [{idx}] [{source['title']}]({source['url']})\n"
         
-        # 모든 관련 자료
+        # 2. 추가 참고자료 (전체 자료 중 인용되지 않은 부분도 포함)
         content += "\n### 🔍 추가 참고자료\n"
         
         # 뉴스 자료
-        content += "\n#### 📰 뉴스 자료\n"
         news_sources = [s for s in all_sources if s['type'] == 'news']
-        for source in news_sources:
-            content += f"- [{source['title']}]({source['url']})"
-            if source['date']:
-                content += f" ({source['date']})"
-            content += "\n"
+        if news_sources:
+            content += "\n#### 📰 뉴스 자료\n"
+            for idx, source in enumerate(news_sources, start=1):
+                if source['date']:
+                    content += f"- [{idx}] [{source['title']}]({source['url']}) ({source['date']})\n"
+                else:
+                    content += f"- [{idx}] [{source['title']}]({source['url']})\n"
         
-        # 학술 자료
-        content += "\n#### 📚 학술/연구 자료\n"
+        # 학술/연구 자료
         academic_sources = [s for s in all_sources if s['type'] == 'academic']
-        for source in academic_sources:
-            content += f"- [{source['title']}]({source['url']})\n"
+        if academic_sources:
+            content += "\n#### 📚 학술/연구 자료\n"
+            for idx, source in enumerate(academic_sources, start=1):
+                content += f"- [{idx}] [{source['title']}]({source['url']})\n"
         
         # Perplexity 검색 결과
-        if any(s for s in all_sources if s['type'] == 'perplexity'):
+        perplexity_sources = [s for s in all_sources if s['type'] == 'perplexity']
+        if perplexity_sources:
             content += "\n#### 🔍 추가 검색 결과\n"
-            perplexity_sources = [s for s in all_sources if s['type'] == 'perplexity']
-            for source in perplexity_sources:
-                content += f"- [{source['title']}]({source['url']})\n"
+            for idx, source in enumerate(perplexity_sources, start=1):
+                content += f"- [{idx}] [{source['title']}]({source['url']})\n"
         
         return content
+
 
     def count_chars(self, text: str) -> dict:
         """글자수 분석"""
